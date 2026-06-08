@@ -1,3 +1,4 @@
+import math
 import random
 import tkinter as tk
 from tkinter import ttk
@@ -27,6 +28,9 @@ MAX_STEPS = 200
 MAX_RESTART = 20
 MAX_STEPS_PER_RESTART = 80
 RANDOM_SEED = 42
+SA_T0 = 10.0
+SA_TMIN = 0.01
+SA_ALPHA = 0.95
 
 
 def flatten(state):
@@ -259,6 +263,139 @@ def build_stochastic_hill_climbing_steps(start_state=START_STATE, goal_state=GOA
     steps.append(
         build_step(
             "Stochastic Hill Climbing",
+            current,
+            [],
+            None,
+            path=path,
+            note=f"Dung do dat gioi han {max_steps} buoc.",
+            stopped=True,
+        )
+    )
+    return steps
+
+
+def build_simulated_annealing_steps(
+    start_state=START_STATE,
+    goal_state=GOAL_STATE,
+    t0=SA_T0,
+    t_min=SA_TMIN,
+    alpha=SA_ALPHA,
+    max_steps=MAX_STEPS,
+):
+    rng = random.Random(RANDOM_SEED)
+    steps = []
+    node_counter = 0
+    current = make_node(get_name(node_counter), start_state)
+    path = [current]
+    temperature = t0
+
+    for _ in range(max_steps):
+        if current["state"] == goal_state:
+            steps.append(
+                build_step(
+                    "Simulated Annealing",
+                    current,
+                    [],
+                    None,
+                    path=path,
+                    note=f"Da dat goal tai node {current['name']}.",
+                    is_goal=True,
+                    stopped=True,
+                )
+            )
+            return steps
+
+        if temperature <= t_min:
+            steps.append(
+                build_step(
+                    "Simulated Annealing",
+                    current,
+                    [],
+                    None,
+                    path=path,
+                    note=f"Dung vi T={temperature:.4f} <= Tmin={t_min}.",
+                    stopped=True,
+                )
+            )
+            return steps
+
+        neighbors = valid_neighbors(current)
+        if not neighbors:
+            steps.append(
+                build_step(
+                    "Simulated Annealing",
+                    current,
+                    [],
+                    None,
+                    path=path,
+                    note="Dung vi khong sinh duoc neighbor hop le.",
+                    stopped=True,
+                )
+            )
+            return steps
+
+        chosen_neighbor = rng.choice(neighbors)
+        delta = chosen_neighbor["h"] - current["h"]
+        accepted = delta < 0
+        probability = 1.0 if accepted else math.exp(-delta / temperature)
+        roll = rng.random()
+
+        if accepted or roll < probability:
+            node_counter += 1
+            child = make_node(
+                get_name(node_counter),
+                chosen_neighbor["state"],
+                current["name"],
+                chosen_neighbor["action"],
+                current["depth"] + 1,
+            )
+            chosen_neighbor["status"] = "chosen better" if delta < 0 else "chosen worse accepted"
+            next_temperature = alpha * temperature
+            steps.append(
+                build_step(
+                    "Simulated Annealing",
+                    current,
+                    neighbors,
+                    child,
+                    path=path,
+                    note=(
+                        f"T={temperature:.4f}, delta={delta}. Chap nhan {child['name']} "
+                        f"voi p={probability:.4f}, random={roll:.4f}. T moi={next_temperature:.4f}."
+                    ),
+                    is_goal=child["state"] == goal_state,
+                    stopped=child["state"] == goal_state,
+                )
+            )
+            current = child
+            path.append(current)
+        else:
+            chosen_neighbor["status"] = "chosen worse rejected"
+            next_temperature = alpha * temperature
+            steps.append(
+                build_step(
+                    "Simulated Annealing",
+                    current,
+                    neighbors,
+                    None,
+                    path=path,
+                    note=(
+                        f"T={temperature:.4f}, delta={delta}. Tu choi neighbor vi "
+                        f"p={probability:.4f}, random={roll:.4f}. T moi={next_temperature:.4f}."
+                    ),
+                )
+            )
+
+        for neighbor in neighbors:
+            if "chosen" not in neighbor["status"]:
+                neighbor["status"] = "not chosen"
+        temperature = next_temperature
+
+        if current["state"] == goal_state:
+            return steps
+
+    steps.append(
+        build_step(
+            "Simulated Annealing",
             current,
             [],
             None,
@@ -549,6 +686,7 @@ class LocalSearchPuzzleUI:
             textvariable=self.algorithm_var,
             values=[
                 "Stochastic Hill Climbing",
+                "Simulated Annealing",
                 "Local Beam Search",
                 "Random-Restart Hill Climbing",
             ],
@@ -712,6 +850,8 @@ class LocalSearchPuzzleUI:
         algorithm = self.algorithm_var.get()
         if algorithm == "Stochastic Hill Climbing":
             self.steps = build_stochastic_hill_climbing_steps()
+        elif algorithm == "Simulated Annealing":
+            self.steps = build_simulated_annealing_steps()
         elif algorithm == "Local Beam Search":
             self.steps = build_local_beam_search_steps()
         else:
