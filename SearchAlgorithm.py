@@ -53,6 +53,9 @@ ALGORITHMS = [
     "Simulated Annealing",
     "Local Beam Search",
     "Random-Restart Hill Climbing",
+    "AND-OR Search",
+    "No Observation Search",
+    "Partial Observation Search",
 ]
 
 RANDOM_SEED = 42
@@ -67,6 +70,10 @@ RANDOM_SCRAMBLE_STEPS = 12
 SA_T0 = 10.0
 SA_TMIN = 0.01
 SA_ALPHA = 0.95
+ANDOR_MAX_DEPTH = 20
+NO_OBS_MAX_EXPAND = 3000
+PARTIAL_OBS_MAX_EXPAND = 3000
+NONDET_BRANCH = 2
 
 
 def flatten(state):
@@ -815,6 +822,336 @@ def build_random_restart_steps(start, goals, run_label="Run 1", max_restart=MAX_
     return all_steps
 
 
+# ========================================================================================
+#  AND-OR Search
+#  Models non-deterministic 8-puzzle: each move may also produce a random "slip"
+#  result. The search builds a conditional/contingency plan tree.
+# ========================================================================================
+
+
+def nondeterministic_results(state, action, rng_seed=RANDOM_SEED):
+    """Return a list of possible outcome states for an action (non-deterministic model).
+    Primary outcome is the normal move. Secondary outcomes simulate 'slips' —
+    the blank may also move in an orthogonal direction."""
+    primary = move_state(state, action)
+    if primary is None:
+        return []
+    outcomes = [primary]
+    row, col = find_zero(state)
+    d_row, d_col = MOVES[action]
+    # Add one orthogonal slip outcome
+    orthogonal = [("Up", "Down"), ("Left", "Right")] if d_row != 0 else [("Left", "Right"), ("Up", "Down")]
+    for slip_action in orthogonal[0]:
+        slip_state = move_state(state, slip_action)
+        if slip_state is not None and slip_state != primary:
+            outcomes.append(slip_state)
+            break
+    return outcomes[:NONDET_BRANCH]
+
+
+def build_andor_steps(start, goals, run_label="Run 1", max_depth=ANDOR_MAX_DEPTH, max_expand=MAX_EXPAND):
+    """AND-OR graph search for non-deterministic 8-puzzle.
+    OR nodes: agent chooses an action.
+    AND nodes: environment chooses an outcome (all outcomes must lead to goal).
+    Returns a step trace for visualisation."""
+    goal_set = set(goals)
+    steps = []
+    node_counter = 0
+    solution = {}  # state -> (action, {outcome_state: ...})
+
+    def or_search(state, path_set, depth):
+        nonlocal node_counter, steps
+        if len(steps) >= max_expand:
+            return False
+        if state in goal_set:
+            node = make_node(get_name(node_counter), state, goals, depth=depth)
+            node_counter += 1
+            steps.append(build_step(
+                "AND-OR Search", run_label, start, goals, node, path=[node],
+                note=f"OR node: goal reached at depth {depth}.", is_goal=True,
+            ))
+            return True
+        if depth >= max_depth:
+            return False
+        if state in path_set:
+            return False  # cycle
+
+        node = make_node(get_name(node_counter), state, goals, depth=depth)
+        node_counter += 1
+
+        for action in MOVES:
+            outcomes = nondeterministic_results(state, action)
+            if not outcomes:
+                continue
+
+            # AND node: try all outcomes
+            children_info = []
+            all_solved = True
+            new_path_set = path_set | {state}
+
+            for outcome in outcomes:
+                child_counter_before = node_counter
+                if outcome in solution:
+                    # Already solved this sub-problem
+                    child = make_node(get_name(node_counter), outcome, goals,
+                                      node["name"], action, depth=depth + 1)
+                    node_counter += 1
+                    children_info.append(child)
+                    continue
+                if not or_search(outcome, new_path_set, depth + 1):
+                    all_solved = False
+                    break
+                child = make_node(get_name(node_counter), outcome, goals,
+                                  node["name"], action, depth=depth + 1)
+                node_counter += 1
+                children_info.append(child)
+
+            if all_solved and children_info:
+                solution[state] = (action, [c["state"] for c in children_info])
+                outcome_labels = ", ".join(compact_state(c["state"]) for c in children_info)
+                steps.append(build_step(
+                    "AND-OR Search", run_label, start, goals, node,
+                    children=children_info,
+                    note=f"AND node: action={action}, outcomes=[{outcome_labels}]. All branches solved.",
+                    is_goal=False,
+                ))
+                return True
+
+        # No action works
+        steps.append(build_step(
+            "AND-OR Search", run_label, start, goals, node,
+            note=f"OR node: no action leads to goal from depth {depth}.",
+            stopped=True,
+        ))
+        return False
+
+    solved = or_search(start, set(), 0)
+    if steps:
+        steps[-1]["stopped"] = True
+        if solved:
+            steps[-1]["note"] = "AND-OR Search: contingency plan found."
+            steps[-1]["is_goal"] = True
+        else:
+            steps[-1]["note"] = f"AND-OR Search: no contingency plan within depth {max_depth}."
+    return steps
+
+
+# ========================================================================================
+#  Searching with No Observation (Sensorless / Conformant Search)
+#  The agent cannot observe the state at all. It maintains a *belief state*
+#  (set of possible physical states) and must find an action sequence that
+#  maps EVERY state in the belief to a goal, regardless of observations.
+# ========================================================================================
+
+
+def belief_apply_action(belief, action):
+    """Apply a deterministic action to every state in a belief set.
+    States where the action is invalid remain unchanged (blank at edge)."""
+    new_belief = set()
+    for state in belief:
+        result = move_state(state, action)
+        new_belief.add(result if result is not None else state)
+    return frozenset(new_belief)
+
+
+def belief_heuristic(belief, goals):
+    """Heuristic for belief states: max manhattan over members (admissible)."""
+    if not belief:
+        return 0
+    return max(heuristic(state, goals) for state in belief)
+
+
+def belief_is_goal(belief, goals):
+    """A belief state is a goal when ALL physical states are goals."""
+    goal_set = set(goals)
+    return all(state in goal_set for state in belief)
+
+
+def build_no_observation_steps(initial_belief_states, goals, run_label="Run 1", max_expand=NO_OBS_MAX_EXPAND):
+    """BFS over belief states with no observations (sensorless).
+    Initial belief: provided directly from the partial start."""
+    initial_belief = frozenset(initial_belief_states)
+    start = min(initial_belief, key=lambda s: heuristic(s, goals)) # representative state for UI
+
+    goal_set = set(goals)
+    steps = []
+    node_counter = 0
+
+    # BFS on belief states
+    queue = deque()
+    explored_beliefs = set()
+    parents = {}
+
+    start_node = make_node(get_name(node_counter), start, goals)
+    start_node["belief_size"] = len(initial_belief)
+    queue.append((initial_belief, start_node, [start_node]))
+    explored_beliefs.add(initial_belief)
+
+    while queue and len(steps) < max_expand:
+        belief, current_node, path = queue.popleft()
+        parents[current_node["name"]] = current_node
+        is_goal = belief_is_goal(belief, goals)
+        b_h = belief_heuristic(belief, goals)
+
+        children = []
+        if not is_goal:
+            for action in MOVES:
+                new_belief = belief_apply_action(belief, action)
+                if new_belief in explored_beliefs:
+                    continue
+                explored_beliefs.add(new_belief)
+                node_counter += 1
+                # Use a representative state for display
+                rep_state = min(new_belief, key=lambda s: heuristic(s, goals))
+                child = make_node(
+                    get_name(node_counter), rep_state, goals,
+                    current_node["name"], action,
+                    current_node["g"] + 1, current_node["depth"] + 1,
+                )
+                child["belief_size"] = len(new_belief)
+                children.append(child)
+                queue.append((new_belief, child, path + [child]))
+
+        belief_states_str = ", ".join(compact_state(s) for s in sorted(belief, key=compact_state)[:5])
+        if len(belief) > 5:
+            belief_states_str += f" ... (+{len(belief) - 5} more)"
+
+        steps.append(build_step(
+            "No Observation Search", run_label, start, goals, current_node,
+            children=children,
+            frontier=[item[1] for item in list(queue)[:50]],
+            explored=list(explored_beliefs)[:50],
+            path=path,
+            note=f"Belief size={len(belief)}, h_max={b_h}. States: [{belief_states_str}]"
+                 if not is_goal else f"Goal: all {len(belief)} belief states are goals!",
+            is_goal=is_goal,
+            stopped=is_goal,
+            metrics={"belief_size": len(belief), "h_max": b_h},
+        ))
+        if is_goal:
+            break
+
+    if steps and not steps[-1]["is_goal"]:
+        steps[-1]["stopped"] = True
+        steps[-1]["note"] += f" | Stopped after exploring {len(explored_beliefs)} belief states."
+    return steps
+
+
+# ========================================================================================
+#  Searching for Partially Observable Problems
+#  The agent can observe *some* tiles (e.g., the tiles adjacent to the blank).
+#  After each action, the observation is used to prune impossible states from
+#  the belief set, keeping it smaller than the sensorless case.
+# ========================================================================================
+
+
+def observe_adjacent_tiles(state):
+    """Partial observation: the agent sees the values of tiles directly
+    adjacent to the blank (up/down/left/right) and the blank position itself.
+    Returns a hashable observation tuple."""
+    row, col = find_zero(state)
+    observed = [(row, col, 0)]  # blank position
+    for action, (dr, dc) in MOVES.items():
+        nr, nc = row + dr, col + dc
+        if 0 <= nr < 3 and 0 <= nc < 3:
+            observed.append((nr, nc, state[nr][nc]))
+    return tuple(sorted(observed))
+
+
+def belief_filter_observation(belief, observation):
+    """Keep only belief states consistent with the given observation."""
+    filtered = set()
+    for state in belief:
+        if observe_adjacent_tiles(state) == observation:
+            filtered.add(state)
+    return frozenset(filtered) if filtered else belief  # fallback: keep all if filter empties
+
+
+def build_partial_observation_steps(initial_belief_states, goals, run_label="Run 1", max_expand=PARTIAL_OBS_MAX_EXPAND):
+    """BFS over belief states with partial observations.
+    After each action, the agent observes adjacent tiles to prune belief."""
+    # Apply initial observation to prune from the provided belief
+    # We assume the 'true' state is the first one to simulate the initial observation
+    true_state = list(initial_belief_states)[0]
+    initial_obs = observe_adjacent_tiles(true_state)
+    initial_belief = belief_filter_observation(frozenset(initial_belief_states), initial_obs)
+    start = true_state # representative state for UI
+
+    goal_set = set(goals)
+    steps = []
+    node_counter = 0
+
+    queue = deque()
+    explored_beliefs = set()
+    parents = {}
+
+    start_node = make_node(get_name(node_counter), start, goals)
+    start_node["belief_size"] = len(initial_belief)
+    queue.append((initial_belief, start_node, [start_node]))
+    explored_beliefs.add(initial_belief)
+
+    while queue and len(steps) < max_expand:
+        belief, current_node, path = queue.popleft()
+        parents[current_node["name"]] = current_node
+        is_goal = belief_is_goal(belief, goals)
+        b_h = belief_heuristic(belief, goals)
+
+        children = []
+        if not is_goal:
+            for action in MOVES:
+                # Apply action to every state in belief
+                new_belief_raw = belief_apply_action(belief, action)
+                # For each resulting state, observe and group by observation
+                obs_groups = {}
+                for state in new_belief_raw:
+                    obs = observe_adjacent_tiles(state)
+                    obs_groups.setdefault(obs, set()).add(state)
+                # Use the largest observation group as representative new belief
+                # (in a full implementation, we'd branch for each observation)
+                largest_group_obs = max(obs_groups, key=lambda o: len(obs_groups[o]))
+                new_belief = frozenset(obs_groups[largest_group_obs])
+
+                if new_belief in explored_beliefs:
+                    continue
+                explored_beliefs.add(new_belief)
+                node_counter += 1
+                rep_state = min(new_belief, key=lambda s: heuristic(s, goals))
+                child = make_node(
+                    get_name(node_counter), rep_state, goals,
+                    current_node["name"], action,
+                    current_node["g"] + 1, current_node["depth"] + 1,
+                )
+                child["belief_size"] = len(new_belief)
+                children.append(child)
+                queue.append((new_belief, child, path + [child]))
+
+        belief_states_str = ", ".join(compact_state(s) for s in sorted(belief, key=compact_state)[:5])
+        if len(belief) > 5:
+            belief_states_str += f" ... (+{len(belief) - 5} more)"
+        obs_str = str(observe_adjacent_tiles(current_node["state"]))
+
+        steps.append(build_step(
+            "Partial Observation Search", run_label, start, goals, current_node,
+            children=children,
+            frontier=[item[1] for item in list(queue)[:50]],
+            explored=list(explored_beliefs)[:50],
+            path=path,
+            note=(f"Belief size={len(belief)} (after observation pruning), h_max={b_h}. "
+                  f"Obs={obs_str}")
+                 if not is_goal else f"Goal: all {len(belief)} belief states are goals!",
+            is_goal=is_goal,
+            stopped=is_goal,
+            metrics={"belief_size": len(belief), "h_max": b_h, "obs_groups": len(set(observe_adjacent_tiles(s) for s in belief))},
+        ))
+        if is_goal:
+            break
+
+    if steps and not steps[-1]["is_goal"]:
+        steps[-1]["stopped"] = True
+        steps[-1]["note"] += f" | Stopped after exploring {len(explored_beliefs)} belief states."
+    return steps
+
+
 def build_steps_for_start(algorithm, start, goals, run_label):
     if algorithm == "BFS":
         return build_bfs_steps(start, goals, run_label)
@@ -838,6 +1175,12 @@ def build_steps_for_start(algorithm, start, goals, run_label):
         return build_simulated_annealing_steps(start, goals, run_label)
     if algorithm == "Local Beam Search":
         return build_local_beam_steps(start, goals, run_label)
+    if algorithm == "AND-OR Search":
+        return build_andor_steps(start, goals, run_label)
+    if algorithm == "No Observation Search":
+        return build_no_observation_steps(start, goals, run_label)
+    if algorithm == "Partial Observation Search":
+        return build_partial_observation_steps(start, goals, run_label)
     return build_random_restart_steps(start, goals, run_label)
 
 
@@ -874,20 +1217,21 @@ def build_complex_steps(algorithm, starts, goals):
     if not run_results:
         raise ValueError("Khong tao duoc step nao.")
     summaries = build_run_summaries(run_results, goals)
-    best = choose_best_run(run_results, goals)
-    for step in best["steps"]:
-        step["runs"] = summaries
-        step["note"] = f"{step['note']} Selected from {len(run_results)} start run(s)."
-    return best["steps"], summaries
+    return run_results, summaries
 
 
 def build_run_summaries(run_results, goals):
     summaries = []
     for result in run_results:
         goal_index = next((index for index, step in enumerate(result["steps"], start=1) if step["is_goal"]), None)
-        final_h = heuristic(result["final_state"], goals)
+        start_val = result['start']
+        if isinstance(start_val, tuple) and len(start_val) > 0 and isinstance(start_val[0], tuple) and len(start_val[0]) == 3 and isinstance(start_val[0][0], int):
+            start_str = compact_state(start_val)
+        else:
+            start_str = f"Belief({len(start_val)} states)"
+        final_h = heuristic(result["final_state"], goals) if result["final_state"] else "-"
         summaries.append(
-            f"{result['label']} | start={compact_state(result['start'])} | "
+            f"{result['label']} | start={start_str} | "
             f"steps={len(result['steps'])} | goal_step={goal_index or '-'} | final_h={final_h}"
         )
     return summaries
@@ -931,8 +1275,7 @@ class ComplexSearchLabUI:
         self.current_state = DEFAULT_START_STATES[0]
 
         self.build_layout()
-        self.draw_board(self.current_state)
-        self.reset_info()
+        self.update_randomized_boards([DEFAULT_START_STATES[0]], DEFAULT_GOAL_STATES, "Choose an algorithm and press Run.")
 
     def build_layout(self):
         self.root.configure(bg=self.colors["bg"])
@@ -951,10 +1294,17 @@ class ComplexSearchLabUI:
             font=("Segoe UI", 19, "bold"),
         ).pack(side="left")
 
+        self.random_mode_var = tk.StringVar(value="Single Mode")
+
         controls = tk.Frame(header, bg=self.colors["bg"])
         controls.pack(side="right")
         ttk.Label(controls, text="Algorithm").pack(side="left", padx=(0, 6))
-        ttk.Combobox(controls, textvariable=self.algorithm_var, values=ALGORITHMS, state="readonly", width=31).pack(side="left", padx=(0, 8))
+        combo = ttk.Combobox(controls, textvariable=self.algorithm_var, values=ALGORITHMS, state="readonly", width=25)
+        combo.pack(side="left", padx=(0, 8))
+        
+        mode_combo = ttk.Combobox(controls, textvariable=self.random_mode_var, values=["Single Mode", "Multi Mode"], state="readonly", width=12)
+        mode_combo.pack(side="left", padx=(0, 8))
+        
         ttk.Button(controls, text="Random Start", command=self.randomize_start).pack(side="left", padx=3)
         ttk.Button(controls, text="Random Goal", command=self.randomize_goal).pack(side="left", padx=3)
         ttk.Button(controls, text="Random Both", command=self.randomize_both).pack(side="left", padx=3)
@@ -983,7 +1333,6 @@ class ComplexSearchLabUI:
 
         self.start_text = self.add_text_box(left, "Start states (one per line)", DEFAULT_START_STATES)
         self.goal_text = self.add_text_box(left, "Goal states (one per line)", DEFAULT_GOAL_STATES)
-        self.partial_text = self.add_raw_text_box(left, "Partial start (? unknown)", "2 ? 3\n1 6 4\n7 0 ?")
 
         right = self.make_panel(main)
         right.pack(side="left", fill="both", expand=True)
@@ -1004,15 +1353,15 @@ class ComplexSearchLabUI:
         self.delta_label = self.info_row(info, "delta")
         self.p_label = self.info_row(info, "p")
         self.random_label = self.info_row(info, "random")
-        self.status_label = self.info_row(info, "Status")
+        self.status_label = self.info_row(info, "Status", is_multi=False)
 
         tabs = ttk.Notebook(right)
         tabs.pack(fill="both", expand=True, padx=14, pady=(0, 14))
         self.children_text = self.make_text_tab(tabs, "Children / Neighbors")
         self.frontier_text = self.make_text_tab(tabs, "Frontier / Beam")
         self.path_text = self.make_text_tab(tabs, "Path")
-        self.runs_text = self.make_text_tab(tabs, "Runs")
         self.log_text = self.make_text_tab(tabs, "Step Log")
+        self.runs_text = self.make_single_text_tab(tabs, "Runs")
 
     def make_panel(self, parent):
         return tk.Frame(parent, bg=self.colors["panel"], highlightbackground=self.colors["border"], highlightthickness=1)
@@ -1021,9 +1370,9 @@ class ComplexSearchLabUI:
         return self.add_raw_text_box(parent, title, "\n".join(compact_state(state) for state in states))
 
     def add_raw_text_box(self, parent, title, value):
-        box = tk.LabelFrame(parent, text=title, bg=self.colors["panel"], fg=self.colors["text"], padx=8, pady=6)
-        box.pack(fill="x", padx=14, pady=(0, 10))
-        text = tk.Text(box, height=3, wrap="word", font=("Consolas", 10), bg="#f8fafc", relief="flat", padx=8, pady=6)
+        box = tk.LabelFrame(parent, text=title, bg=self.colors["panel"], fg=self.colors["text"], padx=8, pady=4)
+        box.pack(fill="x", padx=14, pady=(0, 6))
+        text = tk.Text(box, height=2, wrap="word", font=("Consolas", 10), bg="#f8fafc", relief="flat", padx=8, pady=4)
         text.pack(fill="x")
         text.insert("1.0", value)
         return text
@@ -1031,68 +1380,197 @@ class ComplexSearchLabUI:
     def make_text_tab(self, notebook, title):
         frame = tk.Frame(notebook, bg=self.colors["panel"])
         notebook.add(frame, text=title)
+        frame.text_widgets = []
+        return frame
+
+    def make_single_text_tab(self, notebook, title):
+        frame = tk.Frame(notebook, bg=self.colors["panel"])
+        notebook.add(frame, text=title)
         text = tk.Text(frame, wrap="word", bg="#f8fafc", fg=self.colors["text"], relief="flat", font=("Consolas", 10), padx=10, pady=10)
         text.pack(fill="both", expand=True, padx=10, pady=10)
         text.config(state="disabled")
         return text
 
-    def info_row(self, parent, label):
+    def info_row(self, parent, label, is_multi=True):
         row = tk.Frame(parent, bg=self.colors["panel"])
         row.pack(fill="x", pady=1)
         tk.Label(row, text=f"{label}:", width=10, anchor="w", bg=self.colors["panel"], fg=self.colors["muted"], font=("Segoe UI", 10, "bold")).pack(side="left")
-        value = tk.Label(row, text="-", anchor="w", bg=self.colors["panel"], fg=self.colors["text"], font=("Segoe UI", 10))
-        value.pack(side="left", fill="x", expand=True)
-        return value
+        if is_multi:
+            val_frame = tk.Frame(row, bg=self.colors["panel"])
+            val_frame.pack(side="left", fill="x", expand=True)
+            val_frame.labels = []
+            return val_frame
+        else:
+            value = tk.Label(row, text="-", anchor="w", bg=self.colors["panel"], fg=self.colors["text"], font=("Segoe UI", 10))
+            value.pack(side="left", fill="x", expand=True)
+            return value
 
-    def draw_board(self, state, is_goal=False):
+    def draw_multi_boards(self, frame_data):
         self.canvas.delete("all")
-        size = 96
-        gap = 10
-        start_x = 26
-        start_y = 26
-        for row, values in enumerate(state):
-            for col, value in enumerate(values):
-                x1 = start_x + col * (size + gap)
-                y1 = start_y + row * (size + gap)
-                x2 = x1 + size
-                y2 = y1 + size
-                fill = self.colors["empty"] if value == 0 else self.colors["goal"] if is_goal else self.colors["tile"]
-                text = "_" if value == 0 else str(value)
-                text_color = self.colors["muted"] if value == 0 else self.colors["tile_text"]
-                self.canvas.create_rectangle(x1, y1, x2, y2, fill=fill, outline="")
-                self.canvas.create_text((x1 + x2) / 2, (y1 + y2) / 2, text=text, fill=text_color, font=("Segoe UI", 28, "bold"))
-        self.canvas.create_rectangle(start_x - 8, start_y - 8, start_x + 3 * size + 2 * gap + 8, start_y + 3 * size + 2 * gap + 8, outline=self.colors["border"], width=2)
+        n = len(frame_data)
+        if n == 0:
+            return
+        spacing = 20
+        # Limit the board width so that vertical contents (including labels) fit within 360px height.
+        board_w = min(260.0, (340.0 - spacing * (n - 1)) / n)
+        gap = max(2.0, board_w * 0.05)
+        size = (board_w - 2 * gap) / 3.0
+        
+        # Center vertically: total block height is board_w + 70 (25px top space, 45px bottom space)
+        start_y = (360.0 - board_w - 70.0) / 2.0 + 25.0
+        
+        # Center horizontally: total width of all boards = n * board_w + (n-1) * spacing
+        total_w = n * board_w + (n - 1) * spacing
+        margin_x = (360.0 - total_w) / 2.0
+
+        # Dynamic font sizes to prevent overlapping / clipping
+        label_font_size = 12 if n == 1 else 11 if n == 2 else 10
+        metric_font_size = 10 if n == 1 else 9 if n == 2 else 8
+
+        for i, step in enumerate(frame_data):
+            node = display_node_for_step(step)
+            state = node["state"]
+            is_goal = step.get("is_goal", False)
+            start_x = margin_x + i * (board_w + spacing)
+            self.canvas.create_text(start_x + board_w/2, start_y - 20, text=step.get("run_label", f"Run {i+1}"), fill=self.colors["text"], font=("Segoe UI", label_font_size, "bold"))
+            for row, values in enumerate(state):
+                for col, value in enumerate(values):
+                    x1 = start_x + col * (size + gap)
+                    y1 = start_y + row * (size + gap)
+                    x2 = x1 + size
+                    y2 = y1 + size
+                    fill = self.colors["empty"] if value == 0 else self.colors["goal"] if is_goal else self.colors["tile"]
+                    text = "_" if value == 0 else str(value)
+                    text_color = self.colors["muted"] if value == 0 else self.colors["tile_text"]
+                    self.canvas.create_rectangle(x1, y1, x2, y2, fill=fill, outline="")
+                    self.canvas.create_text((x1 + x2) / 2, (y1 + y2) / 2, text=text, fill=text_color, font=("Segoe UI", max(8, int(size*0.5)), "bold"))
+            self.canvas.create_rectangle(start_x - 4, start_y - 4, start_x + board_w + 4, start_y + board_w + 4, outline=self.colors["border"], width=2)
+            action_text = self.describe_action(node)
+            g_text = node.get("g", "-")
+            h_text = node.get("h", "-")
+            self.canvas.create_text(start_x + board_w/2, start_y + board_w + 18, text=f"Action: {action_text}", fill=self.colors["muted"], font=("Segoe UI", metric_font_size))
+            self.canvas.create_text(start_x + board_w/2, start_y + board_w + 34, text=f"g={g_text} h={h_text}", fill=self.colors["muted"], font=("Segoe UI", metric_font_size))
 
     def collect_environment(self):
         goals = parse_state_list(self.goal_text.get("1.0", "end"))
         if not goals:
-            raise ValueError("Can nhap it nhat 1 goal.")
-        explicit_starts = parse_state_list(self.start_text.get("1.0", "end"))
-        partial_value = self.partial_text.get("1.0", "end").strip()
-        partial_starts = expand_partial_start(partial_value, goals) if partial_value else []
-        starts = merge_unique_states(explicit_starts, partial_starts)
+            raise ValueError("Cần nhập ít nhất 1 goal.")
+            
+        algorithm = self.algorithm_var.get()
+        start_lines = [line.strip() for line in self.start_text.get("1.0", "end").split("\n") if line.strip()]
+        if not start_lines:
+            raise ValueError("Cần nhập ít nhất 1 start state.")
+            
+        starts = []
+        partial_starts = []
+        
+        if algorithm in ["No Observation Search", "Partial Observation Search"]:
+            for line in start_lines:
+                num_unknowns = line.count("?")
+                if num_unknowns == 0:
+                    raise ValueError(f"Thuật toán Belief-state yêu cầu dấu '?' nhưng dòng sau không có: {line}")
+                if num_unknowns > 2:
+                    raise ValueError(f"Chỉ cho phép tối đa 2 dấu '?' mỗi dòng để đảm bảo hiệu suất. Dòng vi phạm: {line}")
+                initial_belief = expand_partial_start(line, goals)
+                if not initial_belief:
+                    raise ValueError(f"Không tạo được belief state hợp lệ nào từ: {line}")
+                starts.append(tuple(initial_belief))
+            return starts, goals, []
+
+        for line in start_lines:
+            if "?" in line:
+                expanded = expand_partial_start(line, goals)
+                partial_starts.extend(expanded)
+                for st in expanded:
+                    if st not in starts:
+                        starts.append(st)
+            else:
+                try:
+                    state = parse_state_tokens(line)
+                    st = to_state(state)
+                    if not is_valid_state(st):
+                        raise ValueError("Trạng thái phải chứa đúng các số 0..8, không trùng lặp.")
+                    if st not in starts:
+                        starts.append(st)
+                except Exception:
+                    pass
+
         starts = [state for state in starts if is_solvable_with_any_goal(state, goals)]
         if not starts:
-            raise ValueError("Khong co start hop le/solvable voi tap goal.")
+            raise ValueError("Không có start hợp lệ/solvable với tập goal.")
+        if len(starts) > 3:
+            raise ValueError("Chỉ hỗ trợ hiển thị tối đa 3 Run song song. Vui lòng giảm bớt Start states.")
         return starts, goals, partial_starts
 
     def replace_text(self, widget, value):
         widget.delete("1.0", "end")
         widget.insert("1.0", value)
 
-    def clear_partial_start(self):
-        self.replace_text(self.partial_text, "")
-
-    def update_randomized_board(self, start_state, status):
+    def update_randomized_boards(self, starts, goals, status):
         self.stop_auto()
         self.steps = []
         self.step_index = 0
-        self.current_state = start_state
-        self.draw_board(start_state)
+        
+        algorithm = self.algorithm_var.get()
+        is_belief = algorithm in ["No Observation Search", "Partial Observation Search"]
+        
+        display_states = []
+        for item in starts:
+            if is_belief:
+                display_states.append(item[0])
+            else:
+                display_states.append(item)
+                
+        mock_steps = []
+        runs_steps = []
+        for i, state in enumerate(display_states, start=1):
+            h_val = heuristic(state, goals)
+            mock_step = {
+                "run_label": f"Run {i}",
+                "is_goal": state in set(goals),
+                "nearest_goal": nearest_goal(state, goals),
+                "children": [],
+                "path": [],
+                "expanded": {
+                    "state": state,
+                    "name": "-",
+                    "g": 0,
+                    "h": h_val,
+                    "f": h_val,
+                    "parent": None,
+                    "action": None
+                },
+                "metrics": {}
+            }
+            mock_steps.append(mock_step)
+            runs_steps.append([mock_step])
+            
+        self.runs_steps = runs_steps
+        self.draw_multi_boards(mock_steps)
+        
+        n_runs = len(display_states)
+        for val_frame in [self.algorithm_label, self.run_label, self.start_label, self.goal_label, self.step_label, self.node_label, self.action_label, self.g_label, self.h_label, self.f_label, self.t_label, self.delta_label, self.p_label, self.random_label]:
+            for widget in val_frame.winfo_children():
+                widget.destroy()
+            val_frame.labels = []
+            for _ in range(n_runs):
+                lbl = tk.Label(val_frame, text="-", anchor="w", bg=self.colors["panel"], fg=self.colors["text"], font=("Segoe UI", 10))
+                lbl.pack(side="left", fill="x", expand=True)
+                val_frame.labels.append(lbl)
+
+        for tab_frame in [self.children_text, self.frontier_text, self.path_text, self.log_text]:
+            for widget in tab_frame.winfo_children():
+                widget.destroy()
+            tab_frame.text_widgets = []
+            for _ in range(n_runs):
+                text = tk.Text(tab_frame, wrap="word", bg="#f8fafc", fg=self.colors["text"], relief="flat", font=("Consolas", 10), padx=5, pady=5)
+                text.pack(side="left", fill="both", expand=True, padx=2, pady=2)
+                text.config(state="disabled")
+                tab_frame.text_widgets.append(text)
+
         self.reset_info()
         self.status_label.config(text=status)
-        for widget in (self.children_text, self.frontier_text, self.path_text, self.runs_text, self.log_text):
-            self.set_text(widget, "")
+        self.set_text(self.runs_text, "")
 
     def read_goals_or_generate_one(self, rng):
         try:
@@ -1105,40 +1583,93 @@ class ComplexSearchLabUI:
         self.replace_text(self.goal_text, compact_state(goal))
         return [goal]
 
+    def generate_random_starts_string(self, rng, goals, count):
+        algorithm = self.algorithm_var.get()
+        is_belief = algorithm in ["No Observation Search", "Partial Observation Search"]
+        strings = []
+        for _ in range(count):
+            start = random_start_for_goals(rng, goals)
+            s_str = compact_state(start)
+            if is_belief:
+                s_chars = list(s_str.replace("/", ""))
+                candidates = [i for i, c in enumerate(s_chars) if c != "0"]
+                num_q = rng.choice([1, 2])
+                replace_indices = rng.sample(candidates, num_q)
+                for idx in replace_indices:
+                    s_chars[idx] = "?"
+                s_str = f"{s_chars[0]}{s_chars[1]}{s_chars[2]}/{s_chars[3]}{s_chars[4]}{s_chars[5]}/{s_chars[6]}{s_chars[7]}{s_chars[8]}"
+            strings.append(s_str)
+        return "\n".join(strings)
+
     def randomize_start(self):
         rng = random.Random()
         goals = self.read_goals_or_generate_one(rng)
-        start = random_start_for_goals(rng, goals)
-        self.replace_text(self.start_text, compact_state(start))
-        self.clear_partial_start()
-        self.update_randomized_board(start, "Random start generated; it is solvable with the current goal set.")
+        count = 2 if self.random_mode_var.get() == "Multi Mode" else 1
+        starts_str = self.generate_random_starts_string(rng, goals, count)
+        self.replace_text(self.start_text, starts_str)
+        try:
+            starts, _, _ = self.collect_environment()
+            self.update_randomized_boards(starts, goals, f"Random start generated ({count} line(s)).")
+        except Exception:
+            pass
 
     def randomize_goal(self):
         rng = random.Random()
-        goal = random_goal_state(rng)
-        start = random_start_for_goals(rng, [goal])
-        self.replace_text(self.goal_text, compact_state(goal))
-        self.replace_text(self.start_text, compact_state(start))
-        self.clear_partial_start()
-        self.update_randomized_board(start, "Random goal generated with a solvable matching start.")
+        count = 3 if self.random_mode_var.get() == "Multi Mode" else 1
+        goals = [random_goal_state(rng) for _ in range(count)]
+        self.replace_text(self.goal_text, "\n".join(compact_state(g) for g in goals))
+        start_count = 2 if self.random_mode_var.get() == "Multi Mode" else 1
+        starts_str = self.generate_random_starts_string(rng, goals, start_count)
+        self.replace_text(self.start_text, starts_str)
+        try:
+            starts, _, _ = self.collect_environment()
+            self.update_randomized_boards(starts, goals, f"Random goal generated ({count} line(s)).")
+        except Exception:
+            pass
 
     def randomize_both(self):
-        rng = random.Random()
-        goal = random_goal_state(rng)
-        start = random_start_for_goals(rng, [goal])
-        self.replace_text(self.goal_text, compact_state(goal))
-        self.replace_text(self.start_text, compact_state(start))
-        self.clear_partial_start()
-        self.update_randomized_board(start, "Random start and goal generated; the pair is solvable.")
+        self.randomize_goal()
 
     def run_algorithm(self):
         self.stop_auto()
         try:
             starts, goals, partial_starts = self.collect_environment()
-            self.steps, summaries = build_complex_steps(self.algorithm_var.get(), starts, goals)
+            run_results, summaries = build_complex_steps(self.algorithm_var.get(), starts, goals)
         except Exception as exc:
             messagebox.showerror("Input error", str(exc))
             return
+
+        all_runs_steps = [res["steps"] for res in run_results]
+        self.runs_steps = all_runs_steps
+        max_steps = max((len(steps) for steps in all_runs_steps), default=0)
+        self.steps = []
+        for i in range(max_steps):
+            frame = []
+            for steps in all_runs_steps:
+                idx = min(i, len(steps) - 1)
+                frame.append(steps[idx])
+            self.steps.append(frame)
+
+        n_runs = len(run_results)
+        for val_frame in [self.algorithm_label, self.run_label, self.start_label, self.goal_label, self.step_label, self.node_label, self.action_label, self.g_label, self.h_label, self.f_label, self.t_label, self.delta_label, self.p_label, self.random_label]:
+            for widget in val_frame.winfo_children():
+                widget.destroy()
+            val_frame.labels = []
+            for _ in range(n_runs):
+                lbl = tk.Label(val_frame, text="-", anchor="w", bg=self.colors["panel"], fg=self.colors["text"], font=("Segoe UI", 10))
+                lbl.pack(side="left", fill="x", expand=True)
+                val_frame.labels.append(lbl)
+
+        for tab_frame in [self.children_text, self.frontier_text, self.path_text, self.log_text]:
+            for widget in tab_frame.winfo_children():
+                widget.destroy()
+            tab_frame.text_widgets = []
+            for _ in range(n_runs):
+                text = tk.Text(tab_frame, wrap="word", bg="#f8fafc", fg=self.colors["text"], relief="flat", font=("Consolas", 10), padx=5, pady=5)
+                text.pack(side="left", fill="both", expand=True, padx=2, pady=2)
+                text.config(state="disabled")
+                tab_frame.text_widgets.append(text)
+
         self.step_index = 0
         if self.steps:
             self.show_step(0)
@@ -1150,28 +1681,61 @@ class ComplexSearchLabUI:
         if not self.steps:
             return
         self.step_index = max(0, min(index, len(self.steps) - 1))
-        step = self.steps[self.step_index]
-        node = display_node_for_step(step)
-        self.current_state = node["state"]
-        self.draw_board(node["state"], step["is_goal"])
-        metrics = step["metrics"]
+        frame_data = self.steps[self.step_index]
+        self.draw_multi_boards(frame_data)
+        
+        for i, step in enumerate(frame_data):
+            run_steps = self.runs_steps[i] if i < len(self.runs_steps) else [step]
+            actual_step_idx = min(self.step_index, len(run_steps) - 1)
+            actual_step = run_steps[actual_step_idx]
+            
+            node = display_node_for_step(actual_step)
+            metrics = actual_step.get("metrics", {})
+            self.algorithm_label.labels[i].config(text=actual_step.get("algorithm", "-"))
+            self.run_label.labels[i].config(text=actual_step.get("run_label", "-"))
+            self.start_label.labels[i].config(text=compact_state(actual_step.get("start_state", [])))
+            self.goal_label.labels[i].config(text=compact_state(actual_step.get("nearest_goal", [])))
+            
+            status_suffix = ""
+            if actual_step_idx == len(run_steps) - 1:
+                if actual_step.get("is_goal", False):
+                    status_suffix = " (Goal)"
+                elif actual_step.get("stopped", False):
+                    status_suffix = " (Stuck)"
+            
+            self.step_label.labels[i].config(text=f"{actual_step_idx + 1}/{len(run_steps)}{status_suffix}")
+            self.node_label.labels[i].config(text=node.get("name", "-"))
+            self.action_label.labels[i].config(text=self.describe_action(node))
+            self.g_label.labels[i].config(text=str(node.get("g", "-")))
+            self.h_label.labels[i].config(text=str(node.get("h", "-")))
+            self.f_label.labels[i].config(text=str(node.get("f", "-")))
+            self.t_label.labels[i].config(text=self.format_metric(metrics.get("T")))
+            self.delta_label.labels[i].config(text=self.format_metric(metrics.get("delta")))
+            self.p_label.labels[i].config(text=self.format_metric(metrics.get("p")))
+            self.random_label.labels[i].config(text=self.format_metric(metrics.get("random")))
 
-        self.algorithm_label.config(text=step["algorithm"])
-        self.run_label.config(text=step["run_label"])
-        self.start_label.config(text=compact_state(step["start_state"]))
-        self.goal_label.config(text=compact_state(step["nearest_goal"]))
-        self.step_label.config(text=f"{self.step_index + 1}/{len(self.steps)}")
-        self.node_label.config(text=node["name"])
-        self.action_label.config(text=self.describe_action(node))
-        self.g_label.config(text=str(node["g"]))
-        self.h_label.config(text=str(node["h"]))
-        self.f_label.config(text=str(node["f"]))
-        self.t_label.config(text=self.format_metric(metrics.get("T")))
-        self.delta_label.config(text=self.format_metric(metrics.get("delta")))
-        self.p_label.config(text=self.format_metric(metrics.get("p")))
-        self.random_label.config(text=self.format_metric(metrics.get("random")))
-        self.status_label.config(text=step["note"])
-        self.update_texts()
+            if i < len(self.children_text.text_widgets):
+                self.children_text.text_widgets[i].config(state="normal")
+                self.children_text.text_widgets[i].delete("1.0", "end")
+                self.children_text.text_widgets[i].insert("1.0", self.format_children(actual_step))
+                self.children_text.text_widgets[i].config(state="disabled")
+                
+                self.frontier_text.text_widgets[i].config(state="normal")
+                self.frontier_text.text_widgets[i].delete("1.0", "end")
+                self.frontier_text.text_widgets[i].insert("1.0", self.format_frontier(actual_step))
+                self.frontier_text.text_widgets[i].config(state="disabled")
+                
+                self.path_text.text_widgets[i].config(state="normal")
+                self.path_text.text_widgets[i].delete("1.0", "end")
+                self.path_text.text_widgets[i].insert("1.0", self.format_path(actual_step.get("path", [])))
+                self.path_text.text_widgets[i].config(state="disabled")
+                
+                self.log_text.text_widgets[i].config(state="normal")
+                self.log_text.text_widgets[i].delete("1.0", "end")
+                self.log_text.text_widgets[i].insert("1.0", self.format_log(i))
+                self.log_text.text_widgets[i].config(state="disabled")
+
+        self.status_label.config(text=f"Displayed frame {self.step_index + 1}/{len(self.steps)}.")
 
     def format_metric(self, value):
         if value is None:
@@ -1186,13 +1750,6 @@ class ComplexSearchLabUI:
         if node["parent"] is None:
             return "START"
         return f"{node['parent']} --{node['action']}--> {node['name']}"
-
-    def update_texts(self):
-        step = self.steps[self.step_index]
-        self.set_text(self.children_text, self.format_children(step))
-        self.set_text(self.frontier_text, self.format_frontier(step))
-        self.set_text(self.path_text, self.format_path(step["path"]))
-        self.set_text(self.log_text, self.format_log())
 
     def format_children(self, step):
         items = step["neighbors"] or step["children"]
@@ -1230,13 +1787,18 @@ class ComplexSearchLabUI:
             lines.append("")
         return "\n".join(lines)
 
-    def format_log(self):
+    def format_log(self, run_index):
         lines = []
-        for index, step in enumerate(self.steps[: self.step_index + 1], start=1):
+        if run_index >= len(self.runs_steps):
+            return ""
+        run_steps = self.runs_steps[run_index]
+        actual_limit = min(self.step_index, len(run_steps) - 1)
+        for index in range(actual_limit + 1):
+            step = run_steps[index]
             node = step["expanded"]
             lines.append(
-                f"Step {index}: {step['algorithm']} | {step['run_label']} | expanded={node['name']} | "
-                f"g={node['g']} | h={node['h']} | f={node['f']} | {step['note']}"
+                f"Step {index + 1}: {step.get('algorithm', '-')} | {step.get('run_label', '-')} | expanded={node.get('name', '-')} | "
+                f"g={node.get('g', '-')} | h={node.get('h', '-')} | f={node.get('f', '-')} | {step.get('note', '')}"
             )
         return "\n".join(lines)
 
@@ -1279,35 +1841,19 @@ class ComplexSearchLabUI:
         self.auto_button.config(text="Auto Run")
 
     def reset_info(self):
-        for label in (
-            self.algorithm_label,
-            self.run_label,
-            self.start_label,
-            self.goal_label,
-            self.step_label,
-            self.node_label,
-            self.action_label,
-            self.g_label,
-            self.h_label,
-            self.f_label,
-            self.t_label,
-            self.delta_label,
-            self.p_label,
-            self.random_label,
-            self.status_label,
+        for val_frame in (
+            self.algorithm_label, self.run_label, self.start_label, self.goal_label,
+            self.step_label, self.node_label, self.action_label, self.g_label,
+            self.h_label, self.f_label, self.t_label, self.delta_label,
+            self.p_label, self.random_label
         ):
-            label.config(text="-")
+            if hasattr(val_frame, 'labels'):
+                for lbl in val_frame.labels:
+                    lbl.config(text="-")
         self.status_label.config(text="Choose an algorithm and press Run.")
 
     def reset(self):
-        self.stop_auto()
-        self.steps = []
-        self.step_index = 0
-        self.current_state = DEFAULT_START_STATES[0]
-        self.draw_board(self.current_state)
-        self.reset_info()
-        for widget in (self.children_text, self.frontier_text, self.path_text, self.runs_text, self.log_text):
-            self.set_text(widget, "")
+        self.update_randomized_boards([DEFAULT_START_STATES[0]], DEFAULT_GOAL_STATES, "Đã reset về trạng thái ban đầu.")
 
 
 def launch_app():
