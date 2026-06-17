@@ -1,18 +1,86 @@
-Các thuật toán trong file SearchAlorithm.py:
-BFS (Breadth-First Search)
-DFS (Depth-First Search)
-IDS (Iterative Deepening Search)
-UCS (Uniform Cost Search)
-A* Search
-Greedy Best-First Search
-Simple Hill Climbing
-Steepest-Ascent Hill Climbing
-Stochastic Hill Climbing
-Simulated Annealing
-Local Beam Search
-Random-Restart Hill Climbing
-AND-OR Search
-No Observation Search (Belief-state search không có quan sát)
-Partial Observation Search (Belief-state search với quan sát một phần)
+# 8-Puzzle Search Lab - Trí Tuệ Nhân Tạo
 
+Đây là một ứng dụng trực quan (GUI) được viết bằng Python (sử dụng Tkinter) để mô phỏng và minh họa các thuật toán tìm kiếm kinh điển trong bộ môn **Trí Tuệ Nhân Tạo**. Bài toán được sử dụng để minh họa là **8-Puzzle** (Trò chơi xếp hình 8 ô).
 
+Ứng dụng cho phép người dùng quan sát từng bước đi (step-by-step), số lượng node mở rộng, chi phí $g(n)$, heuristic $h(n)$ và các chỉ số đo lường hiệu suất của từng thuật toán một cách trực quan nhất.
+
+## Tính năng nổi bật
+- Giao diện đồ họa (GUI) dễ sử dụng, trực quan.
+- Chế độ chạy tự động (Auto Run) có thể điều chỉnh tốc độ hoặc chạy từng bước (Previous/Next).
+- Tạo trạng thái Bắt đầu (Start) và Đích (Goal) ngẫu nhiên có thể giải được.
+- Ghi log (Step Log, Path) chi tiết diễn biến hoạt động của từng thuật toán.
+- Hỗ trợ tổng cộng **20 thuật toán** khác nhau, bám sát đề cương học phần Trí Tuệ Nhân Tạo.
+
+## Danh sách Thuật toán được hỗ trợ
+
+Ứng dụng cài đặt và minh họa toàn bộ 5 nhóm thuật toán đầu tiên trong chương trình học AI:
+
+### Nhóm 1: Uninformed Search (Tìm kiếm mù)
+- **BFS** (Breadth-First Search)
+- **DFS** (Depth-First Search)
+- **IDS** (Iterative Deepening Search)
+- **UCS** (Uniform Cost Search)
+
+### Nhóm 2: Informed Search (Tìm kiếm kinh nghiệm)
+- **Greedy Best-First Search**
+- **A* Search**
+
+### Nhóm 3: Local Search (Tìm kiếm cục bộ)
+- **Simple Hill Climbing**
+- **Steepest-Ascent Hill Climbing**
+- **Stochastic Hill Climbing**
+- **Random-Restart Hill Climbing**
+- **Local Beam Search**
+- **Simulated Annealing** (Luyện kim)
+
+### Nhóm 4: Complex Environments (Môi trường phức tạp)
+- **AND-OR Search**
+- **No Observation Search** (Tìm kiếm không quan sát / Belief-state)
+- **Partial Observation Search** (Tìm kiếm quan sát một phần)
+- **Online Search** (Sử dụng LRTA* - Learning Real-Time A*)
+
+### Nhóm 5: Constraint Satisfaction Problems - CSP (Thỏa mãn ràng buộc)
+*Nhóm thuật toán này coi 8-puzzle như một bài toán Lập kế hoạch độ dài hữu hạn (Bounded-Length Planning), tạo ra một chuỗi $K$ hành động để đánh giá.*
+- **CSP: Backtracking**
+- **CSP: Forward Checking** (Kèm tỉa cành Heuristic)
+- **CSP: Min Conflicts**
+- **CSP: AC-3** (Sử dụng MAC - Maintaining Arc Consistency)
+
+## Cách Cài đặt và Chạy ứng dụng
+
+1. **Yêu cầu môi trường:**
+   - Đã cài đặt **Python 3.7** trở lên.
+   - Thư viện `tkinter` (thường được tích hợp sẵn khi cài Python trên Windows).
+
+2. **Cách chạy:**
+   Mở terminal (hoặc Command Prompt, PowerShell) tại thư mục chứa code và chạy lệnh sau:
+   ```bash
+   python SearchAlgorithm.py
+   ```
+
+3. **Hướng dẫn sử dụng giao diện & Các chế độ chạy:**
+
+   Trên giao diện chính, bạn sẽ thấy các công cụ điều khiển sau:
+   - **Algorithm:** Chọn thuật toán bạn muốn thử nghiệm trong menu thả xuống.
+   - **Mode (Chế độ chạy):**
+     - **Single Mode:** Chạy thuật toán 1 lần duy nhất cho cặp trạng thái Start - Goal hiện tại. Sau khi bấm Run, bạn có thể xem lại từng bước chạy một cách trực quan trên bảng đồ họa 3x3.
+     - **Batch Mode (10) / Batch Mode (50):** Chạy liên tục thuật toán nhiều lần (10 hoặc 50 lần) với các cặp Start - Goal ngẫu nhiên. Chế độ này chủ yếu để kiểm tra tỷ lệ thành công (Success Rate) của các thuật toán mang tính rủi ro ngẫu nhiên (Local Search, Min Conflicts) hoặc để so sánh hiệu suất. Ở chế độ này, giao diện sẽ không vẽ đồ họa từng bước mà hiển thị tổng hợp kết quả (Thời gian, Độ dài path trung bình, Tỷ lệ thành công) ở mục `Runs` phía dưới.
+   - **Random Start / Random Goal / Random Both:** Sinh trạng thái bảng 3x3 ngẫu nhiên nhưng đảm bảo luôn tồn tại lời giải hợp lệ (không vi phạm tính chẵn lẻ Inversions).
+   - **Run:** Bắt đầu tiến hành tìm kiếm lời giải.
+   - **Previous / Next:** (Chỉ có tác dụng trong Single Mode) Dịch chuyển hiển thị trạng thái bảng lùi/tới 1 bước theo log của thuật toán.
+   - **Auto Run / Speed:** (Chỉ có tác dụng trong Single Mode) Tự động chiếu (play) các bước đi như một video. Thanh trượt `Speed` giúp bạn điều chỉnh tốc độ chiếu nhanh hay chậm.
+   - **Các Tab Log (Khung bên dưới):**
+     - **Children / Neighbors:** Hiển thị các node con được sinh ra tại bước hiện tại.
+     - **Frontier / Beam:** Hiển thị trạng thái của tập biên (Frontier) hoặc chùm tia (Beam) trong bộ nhớ.
+     - **Path:** Liệt kê các trạng thái dẫn đến vị trí hiện tại (Đường đi từ Start -> Node hiện tại).
+     - **Step Log:** Nhật ký hành động của từng vòng lặp thuật toán.
+     - **Runs:** Bảng tổng hợp kết quả của các lần chạy (Đặc biệt hữu ích khi dùng Batch Mode).
+
+## Kiến trúc Code
+- `SearchAlgorithm.py`: File duy nhất chứa toàn bộ Logic thuật toán và Giao diện UI. 
+- Hàm `build_steps_for_start(...)`: Mapper chính để điều phối thuật toán dựa vào thuật toán được chọn.
+- Class `App`: Chịu trách nhiệm render Tkinter GUI và vòng lặp sự kiện.
+- Các hàm sinh trạng thái: `make_node`, `move_state`, `heuristic` (Sử dụng Khoảng cách Manhattan).
+
+---
+*Đồ án minh họa trực quan thuật toán môn học Trí Tuệ Nhân Tạo.*
