@@ -1,0 +1,18 @@
+Các thuật toán trong file SearchAlorithm.py:
+BFS (Breadth-First Search)
+DFS (Depth-First Search)
+IDS (Iterative Deepening Search)
+UCS (Uniform Cost Search)
+A* Search
+Greedy Best-First Search
+Simple Hill Climbing
+Steepest-Ascent Hill Climbing
+Stochastic Hill Climbing
+Simulated Annealing
+Local Beam Search
+Random-Restart Hill Climbing
+AND-OR Search
+No Observation Search (Belief-state search không có quan sát)
+Partial Observation Search (Belief-state search với quan sát một phần)
+
+
