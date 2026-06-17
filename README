@@ -1,4 +1,4 @@
-# 8-Puzzle Search Lab - Trí Tuệ Nhân Tạo
+SearchAlgorithm.py
 
 Đây là một ứng dụng trực quan (GUI) được viết bằng Python (sử dụng Tkinter) để mô phỏng và minh họa các thuật toán tìm kiếm kinh điển trong bộ môn **Trí Tuệ Nhân Tạo**. Bài toán được sử dụng để minh họa là **8-Puzzle** (Trò chơi xếp hình 8 ô).
 
